@@ -1,0 +1,681 @@
+---
+title: "03-USDA-microhaplotypes"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Design:
+
+Maddy Young's summer 2025 project was used for this data set.
+
+There are 192 samples for the POGS288 panel from 2 different swabs. The 
+brushy cytology swab and the small dental swab. Each swab had 48 samples
+and an adductor sample was taken from each oyster taken to complete the dataset.
+
+Each swab and adductor sample from a single indiv was prepared on a single 
+96 well plate during GTseq so there is no library prep bias. All samples
+were sequenced on a NextSeq P1 100 cycle kit using Single end reads.
+
+Fastqs were alinged to the amplicons, microtyper was used to score genotypes.
+
+Read in data
+```{r, libraries, warning=F, message=F}
+library(tidyverse)
+library(readxl)
+library(kableExtra)
+library(knitr)
+library(ggplot2)
+library(patchwork)
+```
+
+load genos and look at raw data
+```{r, load-meta}
+meta_seq <- read_tsv("./USDA-microhaplotypes-metadata.tsv")
+```
+
+
+microhaplotype filtering
+```{r, microhap-filtering}
+mhaps <- read_tsv("./USDA-microhaplotypes-raw-sequence-data.tsv") |>
+  mutate(depth = na_if(Count, "noReads")|>as.numeric()) |>
+  left_join(meta_seq%>%dplyr::select(SM,G), join_by(SM)) |>
+  arrange(G, Locus, desc(depth)) |>
+  rename(haplo=Allele,
+         locus=Locus) |>
+  rename(indiv_id = G) |>
+  dplyr::select(indiv_id, locus, haplo, depth) |> 
+      filter(!str_detect(haplo, "N|X"), #remove N and X alleles
+             depth >= 5) %>% #retain only if 5 or more reads
+      arrange(indiv_id, locus, desc(depth)) %>%
+      group_by(indiv_id, locus) %>%
+      dplyr::mutate(rank = row_number(), # calculate allele rank
+             allele.balance = depth / depth[1]) %>% #calculate allele balance
+      filter(allele.balance >= 0.30) %>% #allele balance filter
+      dplyr::mutate(gt_type = ifelse(dplyr::n() > 1, "het", "hom"), #assign het/hom class
+             depth_total = ifelse(gt_type == "het", sum(depth[1], depth[2]), depth)) %>%
+      ungroup() %>%
+      filter(depth_total >= 20) |> #total depth filter
+  group_by(indiv_id, locus) |>
+  filter(n()<=2) |> #removes loci with more than 2 alleles passing filtering.
+  mutate(n2expand = ifelse(n()==2,1,2)) |>
+  uncount(n2expand) |> #adds 2nd allele for homozygotes
+  mutate(gene_copy = row_number()) |> ungroup()
+```
+
+How many instances of 3 alleles passing filter?
+```{r, three-hap-occurrences}
+read_tsv("./USDA-microhaplotypes-raw-sequence-data.tsv") |>
+  mutate(depth = na_if(Count, "noReads")|>as.numeric()) |>
+  left_join(meta_seq%>%dplyr::select(SM,G), join_by(SM)) |>
+  arrange(G, Locus, desc(depth)) |>
+  rename(haplo=Allele,
+         locus=Locus) |>
+  rename(indiv_id = G) |>
+  dplyr::select(indiv_id, locus, haplo, depth) |> 
+      filter(!str_detect(haplo, "N|X"), #remove N and X alleles
+             depth >= 5) %>% #retain only if 5 or more reads
+      arrange(indiv_id, locus, desc(depth)) %>%
+      group_by(indiv_id, locus) %>%
+      dplyr::mutate(rank = row_number(), # calculate allele rank
+             allele.balance = depth / depth[1]) %>% #calculate allele balance
+      filter(allele.balance >= 0.30) %>% #allele balance filter
+      dplyr::mutate(gt_type = ifelse(dplyr::n() > 1, "het", "hom"), #assign het/hom class
+             depth_total = ifelse(gt_type == "het", sum(depth[1], depth[2]), depth)) %>%
+      ungroup() %>%
+      filter(depth_total >= 20) |> #total depth filter
+  group_by(indiv_id, locus) |>
+  filter(n()>2) |> distinct(indiv_id, locus) |> ungroup() |> count(indiv_id)
+
+```
+
+That is not a small number of 3 haplotype loci per indiv. Hopefully it isn't too
+drastic for the concordance analyses.
+
+I need to find out which samples are swabs and which ones are adductors.
+
+```{r, figure-6b-for-paper}
+swab_meta <- read_tsv("./USDA-microhaplotypes-experiment-metadata.tsv")
+
+#pretty figure for the paper will be fig 6b
+fig6b <- mhaps |> distinct(indiv_id,locus) |> count(indiv_id) |> arrange(desc(n)) |>
+  left_join(swab_meta, join_by(indiv_id==Sample_ID)) |>
+  mutate(Sample_type = case_when(
+    sampletype=="adductor" ~ "Adductor",
+    sampletype=="dentalswab" ~ "Microbrush",
+    sampletype=="brushswab" ~ "Cytology brush")) |>
+  group_by(sampletype)|> mutate(tot_n = n()) |> ungroup() |>
+  ggplot(aes(x=Sample_type, y=n)) + 
+  geom_boxplot() +
+    geom_text(aes(
+    label=tot_n, y=0215),size=3.5,
+     angle=65) +
+  ylab("Number of\ngenotyped loci") +
+  xlab("Sample type")+
+  theme_bw() #+
+  #ggtitle("pogs288 microhap panel")
+fig6b
+```
+
+Now start matching samples analysis using CKMRsim
+
+```{r, CKMR-lib}
+library(CKMRsim)
+```
+
+```{r, make-long-genos}
+long_genos <- mhaps |>
+  rename(Indiv = indiv_id,
+         Locus = locus,
+         Allele = haplo) |>
+  dplyr::select(Indiv, Locus, Allele, gene_copy) |>
+  filter(!is.na(Indiv))
+
+loc_per_indiv <- long_genos |> distinct(Indiv,Locus) |> count(Indiv)
+ggplot(loc_per_indiv, aes(x=Indiv,y=n)) + geom_point() #2 samples below 50 need to get removed.
+bad_geno_sucess_samples <- loc_per_indiv |> arrange(n) |> filter(n<50) |> pull(Indiv)
+```
+
+
+Calculate allele freqs and index it
+```{r,make-alle-freqs}
+alle_freqs <- long_genos |>
+  filter(!Indiv %in% bad_geno_sucess_samples) |>
+  dplyr::count(Locus, Allele) |>
+  dplyr::group_by(Locus) |>
+ dplyr:: mutate(Freq = n / sum(n),
+         Chrom = "UNK",#str_extract(Locus, "NC_[0-9]{6}"), # this is screwing up the finding matching samples function
+         Pos = str_extract(Locus, "_[0-9]{1,9}_")%>% gsub("_", "", .) %>% as.numeric(.)) %>%
+  ungroup() %>%
+ dplyr::select(Chrom, Pos, Locus, Allele, Freq) %>%
+  arrange(Pos, desc(Freq)) %>%
+  dplyr::mutate(AlleIdx = NA,
+         LocIdx = NA) %>%
+  filter(!is.na(Allele))
+  
+afreqs_ready <- reindex_markers(alle_freqs)
+```
+
+make ckmrs
+```{r, estimate-ckmrs}
+ex1_ckmr <- create_ckmr(
+  D = afreqs_ready,
+  kappa_matrix = kappas[c("PO", "FS","AN", "U"), ],
+  ge_mod_assumed = ge_model_TGIE,
+  ge_mod_true = ge_model_TGIE,
+  ge_mod_assumed_pars_list = list(epsilon = 0.005),
+  ge_mod_true_pars_list = list(epsilon = 0.005)
+)
+```
+
+matching sample analysis -- find duplicate samples
+```{r, matching-samples-CKMR}
+swab_matchers <- find_close_matching_genotypes(LG = long_genos|>filter(!Indiv%in%bad_geno_sucess_samples),
+                                          CK = ex1_ckmr,
+                                          max_mismatch = 50)
+
+swab_matchers |> filter(str_sub(indiv_1,1,4)==str_sub(indiv_2,1,4)) |>
+  mutate(pct_mismatch = num_mismatch/num_loc) |>
+  ggplot(aes(x=num_loc, y=pct_mismatch)) + geom_point() # no obvious relationship between number of loci and the mismatch frequency.
+
+swab_matchers |> filter(str_sub(indiv_1,1,4)==str_sub(indiv_2,1,4)) |>
+  mutate(pct_mismatch = num_mismatch/num_loc,
+         swab_type = ifelse(str_sub(indiv_1,2,4)<300, "Cytology","Microbrush")) |>
+  ggplot(aes(x=swab_type, y=pct_mismatch)) + geom_jitter(width=0.05)
+```
+
+Figure out whats going on with the 2 really high mismatching samples...those
+are probably human error during the experiment.
+```{r, high-mismatch-explor}
+swab_matchers |> filter(str_sub(indiv_1,1,4)==str_sub(indiv_2,1,4)) |>
+  mutate(pct_mismatch = num_mismatch/num_loc) |> arrange(desc(pct_mismatch)) #T222 and T372
+
+#do they have few loci scored?
+loc_per_indiv|> mutate(samp2chk = str_detect(Indiv, "T222|T372")) |>
+ggplot(aes(x=Indiv,y=n, colour=samp2chk, fill=samp2chk)) + geom_point() 
+#neither sample is extremely low.
+
+#high heterozygosity in either sample?
+
+long_genos |> group_by(Indiv,Locus) |>
+  mutate(gt_type = ifelse(Allele[1]==Allele[2], "hom","het")) |>
+  slice(1) |>
+  ungroup() |>
+  count(Indiv,gt_type) |>
+  group_by(Indiv) |> mutate(pct_type = n/sum(n)) |>
+  filter(gt_type=="het") |> ungroup() |>
+  mutate(oddball = ifelse(Indiv%in%c("T222","T372"), "oddball","normal")) |>
+  ggplot(aes(x=Indiv, y=pct_type,colour=oddball,fill=oddball)) + geom_point()
+```
+
+Nothing too out of the ordinary with those samples yet. Explore some more.
+
+Heterozygosity isn't out of range either. 
+
+Check to see if the mismatches are hom to het or something diff (het to het or hom to hom)
+
+in T372 are they all homozygote to heterozygote mismatches?
+look at genotypes
+```{r, oddball-genotype-classes}
+long_genos|>filter(str_detect(Indiv, "T372"))|>
+  arrange(Locus,Indiv) |>group_by(Locus)|> filter(n()>2) |> arrange(Locus,Allele) |>
+  group_by(Indiv,Locus) |>
+  mutate(gt_type = ifelse(Allele[1]==Allele[2],"hom","het"),
+    genotype = paste0(Allele, collapse = "_")) |>
+  slice(1) |>
+  group_by(Locus) |>
+  arrange(Locus,Indiv) |>
+  mutate(same_gt = genotype[1]==genotype[2]) |>
+  filter(same_gt==FALSE)|>
+  dplyr::select(Indiv, Locus,genotype, gt_type,same_gt) |>
+  group_by(Locus) |> count(gt_type) #all of them are het to hom.
+
+#what about T222
+long_genos|>filter(str_detect(Indiv, "T222"))|>
+  arrange(Locus,Indiv) |>group_by(Locus)|> filter(n()>2) |> arrange(Locus,Allele) |>
+  group_by(Indiv,Locus) |>
+  mutate(gt_type = ifelse(Allele[1]==Allele[2],"hom","het"),
+    genotype = paste0(Allele, collapse = "_")) |>
+  slice(1) |>
+  group_by(Locus) |>
+  arrange(Locus,Indiv) |>
+  mutate(same_gt = genotype[1]==genotype[2]) |>
+  filter(same_gt==FALSE)|>
+  dplyr::select(Indiv, Locus,genotype, gt_type,same_gt) |>
+  group_by(Locus) |> count(gt_type) |> arrange(desc(n)) #all, but 1 are het to hom.
+
+long_genos|>filter(str_detect(Indiv, "T222"), Locus=="NC_047564.1_50516525_50516597") #Shares 1 allele, 2nd allele is different
+```
+
+given there is only 1 locus that had a het-2-het mismatch I'm keeping both
+high mismatch samples in. I think they're real.
+
+0. QA/QC to remove poor samples and samples that aren't from the same indiv.
+  --> only removing the 2 samples that had crappy genotyping rate
+1. percent of loci with mismatching genotypes
+2. are the mismatches homozygote to heterozygote?
+2a. is the missing allele from 2 present in the raw data? i.e. data processing issue?
+
+calc #1
+
+```{r, calculate-percent-mismatching}
+swab_matchers |>
+  mutate(pct_mismatch = num_mismatch/num_loc) |>
+filter(str_sub(indiv_1,1,4)==str_sub(indiv_2,1,4)) |> arrange(indiv_1)
+```
+
+missing 3 samples...which are they?
+```{r, find-missing3-samples}
+good_samps <- swab_matchers |>
+filter(str_sub(indiv_1,1,4)==str_sub(indiv_2,1,4)) |>
+  mutate(s2pull = str_sub(indiv_1,1,4)) %>% pull(s2pull)
+
+swab_meta |> filter(!str_detect(Sample_ID,"_2")&!Sample_ID%in%good_samps)
+```
+
+2 are known in bad genotyping, but T293 is new. whats happened to that one?
+
+```{r, find-T293}
+mhaps |> filter(str_detect(indiv_id,"T293"))
+swab_matchers |> filter(str_detect(indiv_2, "T293"))
+
+long_genos |> filter(str_detect(Indiv,"T293"))
+```
+
+Ok, the swab for T293 is a duplicate for T264. T293 has an adductor tissue sample but does not have a corresponding swab sample to compare to.
+
+```{r, pct-mismatch-by-swab}
+swab_matchers |>
+  filter(str_sub(indiv_1,1,4)==str_sub(indiv_2,1,4)) |>
+  mutate(pct_mismatch = num_mismatch/num_loc) |>
+  dplyr::select(-c(ind1,ind2)) |>
+  mutate(swab_type = ifelse(str_sub(indiv_1,2,4)<300,"brush","dental")) |> 
+  #filter(num_loc>50)|>
+  count(swab_type, num_mismatch) 
+```
+
+Thats not a small number of mismatches.
+
+whats the mean non-match rate by swab type?
+```{r,calc-mismatch-by-swab-type}
+swab_matchers |>
+  filter(str_sub(indiv_1,1,4)==str_sub(indiv_2,1,4)) |>
+  mutate(pct_mismatch = num_mismatch/num_loc) |>
+  dplyr::select(-c(ind1,ind2)) |>
+  mutate(swab_type = ifelse(str_sub(indiv_1,2,4)<300,"brush","dental")) |>
+  group_by(swab_type) |>
+  summarise(mean_mismatch = mean(pct_mismatch),
+            sd_mis = sd(pct_mismatch)) # all samples
+
+swab_matchers |>
+  filter(str_sub(indiv_1,1,4)==str_sub(indiv_2,1,4)) |>
+  mutate(pct_mismatch = num_mismatch/num_loc) |>
+  dplyr::select(-c(ind1,ind2)) |>
+  mutate(swab_type = ifelse(str_sub(indiv_1,2,4)<300,"brush","dental")) |>
+  group_by(swab_type) |>
+  filter(pct_mismatch<0.10)|> #removes 2 very high samples
+  summarise(mean_mismatch = mean(pct_mismatch),
+            sd_mis = sd(pct_mismatch))
+```
+
+visualize mismatch per swab type
+```{r, ggplot-mismatch-swab-type}
+ swab_matchers |>
+  mutate(same_indiv = str_sub(indiv_1,1,4)==str_sub(indiv_2, 1,4),
+         pct_mismatch = num_mismatch/num_loc) |>
+  filter(same_indiv==TRUE) |> 
+    mutate(swab_type = ifelse(str_sub(indiv_1,2,4)<302,"brush","dental")) |>
+  ggplot(aes(x=swab_type, y= pct_mismatch)) + geom_jitter(width=0.02)
+```
+make paper figure this will be fig 6c.
+```{r, figure6c}
+fig6c<- swab_matchers |>
+  mutate(same_indiv = str_sub(indiv_1,1,4)==str_sub(indiv_2, 1,4),
+         pct_mismatch = num_mismatch/num_loc) |>
+  filter(same_indiv==TRUE) |> 
+    mutate(swab_type = ifelse(str_sub(indiv_1,2,4)<302,"Cytology brush","Microbrush")) |>
+  ggplot(aes(x=indiv_1, y=pct_mismatch, shape = swab_type)) + 
+  geom_point(size=2) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 280,vjust = 0.5, hjust = 0.1),
+        legend.position = "bottom") +
+  geom_text(aes(
+    label=num_loc, y=0.295),size=3,
+     angle=80) +
+  scale_x_discrete(name="indiv") +
+  scale_shape_discrete(name = "Swab type")+
+  scale_y_continuous(limits=c(0,0.32), breaks = seq(0.0,.32,0.02), labels=seq(0,32,2), name = "Non-concordance rate")
+fig6c
+```
+ 
+ alternate plots to fig 6c. try a diff attack on this
+```{r}
+swab_matchers |>
+  mutate(same_indiv = str_sub(indiv_1,1,4)==str_sub(indiv_2, 1,4),
+         pct_mismatch = num_mismatch/num_loc) |>
+  filter(same_indiv==TRUE) |> 
+    mutate(swab_type = ifelse(str_sub(indiv_1,2,4)<302,"Cytology brush","Microbrush")) |>
+  ggplot(aes(x=num_loc, y=pct_mismatch, shape = swab_type)) + 
+  geom_jitter(size=2, width=0.01) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 280,vjust = 0.5, hjust = 0.1),
+        legend.position = "bottom") +
+  scale_x_continuous("Number of loci compared", limits = c(75,195), breaks=seq(75,195,10)) +
+  scale_shape_discrete(name = "Swab type")+
+  scale_y_continuous(limits=c(0,0.30), breaks = seq(0.0,.30,0.05), labels=seq(0,30,5), name = "Percent error")
+
+swab_matchers |>
+  mutate(same_indiv = str_sub(indiv_1,1,4)==str_sub(indiv_2, 1,4),
+         pct_mismatch = num_mismatch/num_loc) |>
+  filter(same_indiv==TRUE) |> 
+    mutate(swab_type = ifelse(str_sub(indiv_1,2,4)<302,"Cytology brush","Microbrush")) |>
+  ggplot(aes(x=indiv_1, y=pct_mismatch, shape = swab_type)) + 
+  geom_point(size=2) +
+  theme_bw() + facet_wrap(swab_type~., scales="free", nrow=2) +
+  theme(axis.text.x = element_text(angle = 280,vjust = 0.5, hjust = 0.1),
+        legend.position = "none") +
+  xlab("indiv") +
+  ggh4x::facetted_pos_scales(
+    y = list(
+      scale_y_continuous(limits=c(0.0, 0.3), labels = seq(0,.3,.05), breaks=seq(0,.3,.05),minor_breaks = seq(0,.3,.01)),
+      scale_y_continuous(limits=c(0., 0.15), labels = seq(0,.15,.05), breaks=seq(0,.15,.05),minor_breaks = seq(0,.15,.01))
+    )
+  )
+```
+
+
+step1 determine if these are hets to homozygote mismatches.
+ 
+write a function to compare genotypes and feed it a list of indivs to compare within
+ 
+```{r, function-mismatch-class-id}
+compare_gts <- function(x) {
+  
+num_mismatch <- swab_matchers |> filter(str_detect(indiv_1,x)&str_detect(indiv_2, x)) |> pull(num_mismatch)
+  
+  if(num_mismatch>0) {
+    
+n_loc <- long_genos|> filter(str_detect(Indiv, x)) |>
+  arrange(Locus,Indiv) |> group_by(Locus)|> filter(n()>2) |> #retains loci scored in swab and adductor 
+  distinct(Locus) |> nrow()
+
+outp <- long_genos|> filter(str_detect(Indiv, x)) |>
+  arrange(Locus, Indiv) |> group_by(Locus)|> filter(n()>2) |>
+    arrange(Locus, Allele) |> group_by(Indiv, Locus) |>
+  mutate(gt_type = ifelse(Allele[1]==Allele[2],"hom","het"),
+    genotype = paste0(Allele, collapse = "_")) |>
+  slice(1) |> group_by(Locus) |> arrange(Locus,Indiv) |>
+  mutate(same_gt = genotype[1]==genotype[2]) |>
+  filter(same_gt==FALSE) |>
+  dplyr::select(Indiv, Locus,genotype, gt_type,same_gt) |>
+  group_by(Locus) |> count(gt_type) |> arrange(gt_type) |>
+  mutate(mismatch_class = paste0(gt_type,collapse = "_")) |>
+  slice(1) |> ungroup() |> count(mismatch_class) |>
+  mutate(indiv = x,
+         tot_loci = n_loc)
+  }
+  
+  if(num_mismatch==0) {
+    outp <- swab_matchers |> filter(str_detect(indiv_1,x)&str_detect(indiv_2,x)) |> dplyr::select(indiv_1, num_loc, num_mismatch) |>
+      rename(indiv = indiv_1, tot_loci = num_loc, n = num_mismatch) |>
+      mutate(mismatch_class = NA)
+  }
+outp
+}
+
+samps2compare <- swab_meta |>
+  filter(!str_detect(Sample_ID,"T293|T269|T284")) |> #removing bad samples
+  mutate(short_id = str_sub(Sample_ID,1,4)) |>
+  distinct(short_id) |> pull(short_id)
+
+mismatch_class_df <- map_df(samps2compare, compare_gts)
+
+mismatch_class_df |> group_by(mismatch_class) |>
+  summarise(tot_n = sum(n),
+            n_indiv = n_distinct(indiv)) |>
+  filter(!is.na(mismatch_class))
+```
+
+lets dive into the het to het mismatches a bit.  Who has them?
+```{r}
+mismatch_class_df |> filter(mismatch_class=="het") |> arrange(indiv)
+```
+Ten indivs for 10 occurrences so it is RARE for a het to het mismatch.
+
+investigate these individually since there are so few of them.
+
+```{r, het2het-investigate}
+het_indivs <- mismatch_class_df |> filter(mismatch_class=="het") |> pull(indiv)
+
+investigate_het2het <- function (x) {
+  
+  outp <- long_genos|> filter(str_detect(Indiv, x)) |>
+  arrange(Locus, Indiv) |> group_by(Locus)|> filter(n()>2) |>
+    arrange(Locus, Allele) |> group_by(Indiv, Locus) |>
+  mutate(gt_type = ifelse(Allele[1]==Allele[2],"hom","het"),
+    genotype = paste0(Allele, collapse = "_")) |>
+  slice(1) |> group_by(Locus) |> arrange(Locus,Indiv) |>
+  mutate(same_gt = genotype[1]==genotype[2]) |>
+  filter(same_gt==FALSE) |>
+  dplyr::select(Indiv, Locus,genotype, gt_type,same_gt) |>
+  group_by(Locus) |> count(gt_type) |> arrange(gt_type) |>
+  mutate(mismatch_class = paste0(gt_type,collapse = "_")) |>
+  slice(1) |> ungroup() |> filter(mismatch_class=="het") |>
+  mutate(indiv = x)
+  
+  outp
+}
+
+mismatch_hets <- map_df(het_indivs, investigate_het2het)
+```
+
+load raw microhap data to see if 'missing' haplos are in the raw data
+```{r, load-raw-sequence-haplotypes}
+hap_raw <- read_tsv("./USDA-microhaplotypes-raw-sequence-data.tsv") |>
+  mutate(depth = na_if(Count, "noReads")|>as.numeric()) |>
+  left_join(meta_seq%>%dplyr::select(SM,G), join_by(SM)) |>
+  dplyr::select(-c(Count, SM)) |> group_by(G,Locus) |>
+  mutate(rank = dense_rank(desc(depth))) |> ungroup() |>
+  rename(indiv_id = G)
+```
+
+Start het 2 het investigation
+1st indiv of het2het
+```{r, het2het-one}
+mismatch_hets[1,]
+hap_raw |>
+  filter(str_detect(indiv_id, "T204")&Locus=="NC_047560.1_4226646_4226704") |>
+  arrange(indiv_id, desc(depth)) |> filter(depth>1)
+```
+
+T204; 'missing' haplo is 3rd ranked, 1 read below the 2nd ranked
+
+2nd indiv of het2het
+```{r, het2het-two}
+mismatch_hets[2,]
+hap_raw |>
+  filter(str_detect(indiv_id, "T215")&Locus=="NC_047566.1_45439244_45439308") |>
+  arrange(indiv_id, desc(depth)) |> filter(depth>1)
+```
+T215; missing haplo is 3rd ranked
+
+3rd indiv of het2het
+```{r,het2het-three}
+mismatch_hets[3,]
+hap_raw |>
+  filter(str_detect(indiv_id, "T222")&Locus=="NC_047564.1_50516525_50516597") |>
+  arrange(indiv_id, desc(depth)) |> filter(depth>1)
+```
+
+missing haplo 3rd ranked
+
+4th indiv
+```{r,het2het-four}
+mismatch_hets[4,]
+hap_raw |>
+  filter(str_detect(indiv_id, "T264")&Locus=="NC_047563.1_20695233_20695305") |>
+  arrange(indiv_id, desc(depth)) |> filter(depth>1)
+```
+3rd ranked haplo again
+
+5th indiv
+```{r, het2het-five}
+mismatch_hets[5,]
+hap_raw |>
+  filter(str_detect(indiv_id, "T308")&Locus=="NC_047560.1_61657672_61657746") |>
+  arrange(indiv_id, desc(depth)) |> filter(depth>1)
+```
+3rd ranked
+
+6th indiv
+```{r,het2het-six}
+mismatch_hets[6,]
+hap_raw |>
+  filter(str_detect(indiv_id, "T326")&Locus=="NC_047562.1_43773937_43774008") |>
+  arrange(indiv_id, desc(depth)) |> filter(depth>1)
+```
+3rd ranked haplo...again.
+
+7th indiv
+```{r,het2het-seven}
+mismatch_hets[7,]
+hap_raw |>
+  filter(str_detect(indiv_id, "T335")&Locus=="NC_047566.1_6645297_6645367") |>
+  arrange(indiv_id, desc(depth)) |> filter(depth>1)
+```
+3rd ranked haplotype. 
+
+8th indiv
+```{r,het2het-eight}
+mismatch_hets[8,]
+hap_raw |>
+  filter(str_detect(indiv_id, "T336")&Locus=="NC_047562.1_3344317_3344371") |>
+  arrange(indiv_id, desc(depth)) |> filter(depth>1)
+```
+3rd ranked haplo
+
+9th indiv
+```{r,het2het-nine}
+mismatch_hets[9,]
+hap_raw |>
+  filter(str_detect(indiv_id, "T364")&Locus=="NC_047566.1_21460765_21460816") |>
+  arrange(indiv_id, desc(depth)) |> filter(depth>1)
+```
+4th or 5th haplotype, slightly messier but haplos still present.
+
+```{r, het2het-ten}
+mismatch_hets[10,]
+hap_raw |>
+  filter(str_detect(indiv_id, "T373")&Locus=="NC_047561.1_10060251_10060325") |>
+  arrange(indiv_id, desc(depth)) |> filter(depth>1) |>
+  mutate(rank2spread = paste0("rank_",rank)) |>
+  dplyr::select(-rank, -depth)|>
+  pivot_wider(names_from=rank2spread, values_from = Allele)
+```
+3rd haplotype again.
+
+Summary: all het 2 het mismatches have the 'missing' haplotype present in the
+other samples raw data. Either a data processing issue, or crappy locus 
+
+Now check that all het 2 hom mismatches have the missing allele in raw data.
+
+need a df with the missing allele, the indiv it's missing in and the locus.
+
+```{r, find-missing-haplo-function}
+find_missing_haplo <- function(x) {
+  outp <- mhaps |> 
+    filter(str_detect(indiv_id, x)) |>
+  group_by(locus) |> filter(n()>2) |>
+  group_by(indiv_id, locus) |>
+  arrange(haplo) |> mutate(gt = paste0(haplo,collapse="_")) |>
+  group_by(locus) |>
+  arrange(locus,indiv_id, haplo)|>
+  mutate(same_gt = gt[1]==gt[3]) |> 
+  dplyr::select(indiv_id, locus, haplo, gt_type, gt, same_gt) |>
+  filter(same_gt==FALSE&any(gt_type=="hom")) |> #retain only non-matching genos and the cases with one being a homozygote.
+  group_by(locus, haplo) |>
+  summarise(n_occur = n(),
+            n_indivs = n_distinct(indiv_id),
+            indiv_id = unique(indiv_id)[1]) |>
+  ungroup() |> filter(n_occur==1) |>
+  mutate(indiv2join = ifelse(str_detect(indiv_id,"_2"), str_sub(indiv_id,1,4), paste0(indiv_id, "_2") )) |>
+    ungroup() |>
+  left_join(hap_raw, join_by(locus==Locus, haplo==Allele, indiv2join==indiv_id)) #if NA in rank then it's not in the hap_raw data
+  
+  outp
+}
+
+ids_het2hom <- mismatch_class_df |> filter(mismatch_class=="het_hom") |> pull(indiv)
+het2hom_eval <- map_df(ids_het2hom, find_missing_haplo)
+
+het2hom_eval |> arrange(desc(is.na(rank)))
+```
+
+how many alleles are missing and are they concentrated in certain indivs?
+```{r}
+het2hom_eval |>
+  filter(is.na(rank))|>
+  count(indiv2join) |> mutate(tot = sum(n), pct_indiv = n/tot)
+```
+16 cases where the missing allele in the homozygote case was not present in the sequence data, BUT 13 of the 16 are from one indiv.
+
+is that a poor genotyping indiv?
+```{r}
+mhaps |> filter(indiv_id=="T222_2") |> distinct(locus) |> nrow()
+```
+
+164 loci scored so not terribly low. what about total read depths?
+```{r}
+hap_raw %>% filter(str_detect(indiv_id, "T222")) |>
+  group_by(Locus, indiv_id) |>
+  summarise(tot_reads = sum(depth))|>
+  ungroup() |>
+  ggplot(aes(x=Locus, y=tot_reads, colour=indiv_id, fill=indiv_id)) + geom_point()
+```
+
+yea, generally the T222_2 sample has lower read depth than T222 
+
+For all occurrences of hom2het mismatch is the missing haplotype generally highly ranked?
+```{r,het2hom-missing-haplotype-rankings}
+het2hom_eval |> filter(!is.na(rank)) |>
+  ggplot(aes(x=rank)) + geom_bar() #yep
+
+het2hom_eval |> filter(!is.na(rank)) |> count(rank) |>
+  mutate(pct_rank = n/sum(n))
+```
+
+Make figure 6 for the paper.
+need nanodrop data for panel a
+```{r}
+nanodrop <- read_xlsx("./nanodrop-data-maddy-project.xlsx") |>
+  rename(swab_type = Treatment,
+         indiv_id = sample,
+         DNA_conc = 3)
+
+maddy_meta <- read_xlsx("./tagging-data-maddy-project.xlsx") |>
+  rename(indiv_id = 'Sample #',
+         rep = "Replicate #") # need this dataframe for replicate number
+
+fig6a<- nanodrop |> 
+  left_join(maddy_meta, join_by(indiv_id)) |>
+  mutate(swab_type = case_when(swab_type=="swab" ~ "Cytology",
+                              swab_type== "dental" ~ "Micro"),
+    tx = paste0(swab_type,"_",rep)) |>
+  ggplot(aes(x=tx, y = DNA_conc)) + geom_boxplot() +
+  theme_bw() +
+  ylab ("DNA concentration\n(ng/uL)") + xlab("Swab type")
+```
+
+combine the plots into one figure
+```{r}
+library(ggpubr)
+(fig6a | fig6b) / fig6c + plot_annotation(tag_levels = "A") +
+  plot_layout(widths = c(1.5, 1.5,3), heights = c(2,2,6))
+pl<- ggarrange(fig6a,fig6b,labels = c("A", "B"), ncol=2, widths=c(1,1),label.x = 0.05) 
+ggarrange(pl, fig6c, nrow=2, labels = c("","C"), heights = c(1.5,2))
+
+ggsave("./figure6-swabpaper.png", width=8.5, height=6)
+```
