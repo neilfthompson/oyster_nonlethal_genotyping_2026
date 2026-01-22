@@ -1,0 +1,305 @@
+---
+title: "02-Pacific-thermofisher-microhaplotypes"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## microhaplotype analysis using Thermofisher ampliseq panel
+```{r, libraries}
+library(tidyverse)
+library(readxl)
+```
+
+load microhaplotype data processed with Microhaplot (Ng 2019)
+```{r, load-microhaplotypes}
+mhaps <- readRDS("./thermofisher-microhaplotypes-raw-data.rds")
+
+mhaps %>%
+  arrange(id, locus) %>% group_by(id,locus) %>% 
+  slice(1:5) %>% ungroup() %>% head(20)
+```
+
+join sample names to raw data
+```{r, join-metadata-microhap}
+ion_names <- read_xlsx("./Ion-Code_to_Sample-ID_Key.xlsx") %>% rename(ion_id =2, sample_id=1)
+
+mhap2process <- mhaps %>% 
+  rename(ion_id = id) %>%
+  left_join(., ion_names, join_by(ion_id)) %>%
+  mutate(samp_type  = str_extract(sample_id, "Swab|adductor"),
+         indiv_id = str_extract(sample_id, "G[0-9]{6}")) %>%
+  arrange(indiv_id, locus, haplo, depth) 
+```
+
+filter raw data
+
+```{r, filter-raw-sequence-data}
+genos_processed <- mhap2process |>
+  mutate(grp_id = paste0(indiv_id, "-", samp_type)) |>
+  dplyr::select(indiv_id, locus, haplo, depth, grp_id) |> 
+      filter(!str_detect(haplo, "N|X"), #remove N and X alleles
+             depth >= 5) %>% #retain only if 5 or more reads
+      arrange(indiv_id, locus, desc(depth)) %>%
+      group_by(grp_id, locus) %>%
+      dplyr::mutate(rank = row_number(), # calculate allele rank
+             allele.balance = depth / depth[1]) %>% #calculate allele balance
+      filter(allele.balance >= 0.30) %>% #allele balance filter
+      dplyr::mutate(gt_type = ifelse(dplyr::n() > 1, "het", "hom"), #assign het/hom class
+             depth_total = ifelse(gt_type == "het", sum(depth[1], depth[2]), depth)) %>%
+      ungroup() %>%
+      filter(depth_total >= 20) |> #total depth filter
+  group_by(grp_id, locus) |>
+  filter(n()<=2) |> #removes loci with more than 2 alleles passing filtering.
+  mutate(n2expand = ifelse(n()==2,1,2)) |>
+  uncount(n2expand) |> #adds 2nd allele for homozygotes
+  mutate(gene_copy = row_number()) |> ungroup()
+```
+
+check to see if this panel has more than 2 alleles passing filtering criteria.
+
+```{r, 3hap-loci-identification}
+mhap2process |>
+  mutate(grp_id = paste0(indiv_id, "-", samp_type)) |>
+dplyr::select(indiv_id, locus, haplo, depth, grp_id) |> 
+      filter(!str_detect(haplo, "N|X"), #remove N and X alleles
+             depth >= 5) %>% #retain only if 5 or more reads
+      arrange(indiv_id, locus, desc(depth)) %>%
+      group_by(grp_id, locus) %>%
+      dplyr::mutate(rank = row_number(), # calculate allele rank
+             allele.balance = depth / depth[1]) %>% #calculate allele balance
+      filter(allele.balance >= 0.30) %>% #allele balance filter
+      dplyr::mutate(gt_type = ifelse(dplyr::n() > 1, "het", "hom"), #assign het/hom class
+             depth_total = ifelse(gt_type == "het", sum(depth[1], depth[2]), depth)) %>%
+      ungroup() %>%
+      filter(depth_total >= 20) |> #total depth filter
+  group_by(grp_id, locus) |>
+  filter(n()>2) |> arrange(grp_id, locus, desc(depth)) |> 
+  distinct(grp_id, locus) |> ungroup() |> count(grp_id)
+```
+every sample has at least one locus with more than 3 haplotypes passing filtering.
+
+use CKMRsim to find duplicate genos
+ 
+```{r, CKMR-analysis}
+library(CKMRsim)
+
+alle_freqs <- genos_processed %>% 
+  rename(sample_id = grp_id) %>%
+  dplyr::select(sample_id, locus, haplo, depth) %>%
+  rename(Locus=locus,
+         Allele=haplo) %>%
+  count(Locus, Allele) %>%
+  group_by(Locus) %>%
+  mutate(Freq = n / sum(n),
+         Chrom = "UNK",
+         Pos = cur_group_id()) %>%
+  ungroup() %>% 
+  select(Chrom, Pos, Locus, Allele, Freq) %>%
+  arrange(Pos, desc(Freq)) %>%
+  mutate(AlleIdx = NA,
+         LocIdx = NA) %>%
+  filter(!is.na(Allele))
+
+afreqs_ready <- reindex_markers(alle_freqs)
+```
+
+make ckmr df
+```{r, make-CKMR}
+ex1_ckmr <- create_ckmr(
+  D = afreqs_ready,
+  kappa_matrix = kappas[c("PO", "U"), ],
+  ge_mod_assumed = ge_model_TGIE,
+  ge_mod_true = ge_model_TGIE,
+  ge_mod_assumed_pars_list = list(epsilon = 0.005),
+  ge_mod_true_pars_list = list(epsilon = 0.005)
+)
+```
+
+
+make long-genos and find matching samples
+```{r, compare-genos-find-matching-samples}
+long_genos <- genos_processed %>%
+  mutate(Indiv = grp_id, Locus = locus,   Allele = haplo) %>%
+  dplyr::select(Indiv, Locus, gene_copy, Allele) |> ungroup()
+
+long_genos |> arrange(Indiv, Locus)
+
+mismatchers <- find_close_matching_genotypes(LG = long_genos,
+                                          CK = ex1_ckmr,
+                                          max_mismatch = 100) %>%
+  filter(str_extract(indiv_1,"G[0-9]{6}")==str_extract(indiv_2,"G[0-9]{6}")) %>%
+  mutate(pct_discorant = num_mismatch/num_loc) 
+
+mismatchers |> arrange(desc(pct_discorant)) |>
+  mutate(mean_mismatch = mean(pct_discorant))
+```
+
+ugh. hopefully these are homozygotes to heterozygote issues....but that isn't
+ a small amount of discordance.
+ 
+```{r, ID-mismatches}
+mismatch_genos <- long_genos |> 
+  mutate(indiv_id = str_extract(Indiv, "G[0-9]{6}"))|>
+  arrange(Locus, Allele) |>
+  group_by(Indiv, Locus) |>
+  summarise(gt = paste0(Allele, collapse="_"),
+            indiv_id = unique(indiv_id)) |> 
+  group_by(indiv_id, Locus) |> 
+  filter(n()>1) |> #removes loci with only 1 sample
+  filter(!gt[1]==gt[2]) |> #retains genotypes that do not match
+  mutate(gt_type = case_when(
+    str_extract(gt, "^[A-Z]{1,25}(?=_)")==str_extract(gt, "(?<=_)[A-Z]{1,25}") ~ "hom",
+    !str_extract(gt, "^[A-Z]{1,25}(?=_)")==str_extract(gt, "(?<=_)[A-Z]{1,25}") ~ "het"
+  )) |> ungroup() #added hom or het to each genotype.
+
+mismatch_genos |> distinct(indiv_id, Locus) |> filter(!indiv_id=="G006146")
+```
+
+are any mismatches of the same genotype class? het-to-het or hom-to-hom?
+ 
+```{r, explor-mismatches-same-gt}
+mismatch_genos |> group_by(indiv_id, Locus, gt_type) |>
+  filter(n()>1) |> arrange(Locus, indiv_id) |> ungroup() |> count(indiv_id)
+```
+ 
+the mismatches where they are het-to-het or hom-to-hom are clustered in one sample, G006146
+
+check matching samples analysis to see if that one is odd
+```{r, check-G006146}
+find_close_matching_genotypes(LG = long_genos,
+                                          CK = ex1_ckmr,
+                                          max_mismatch = 50) %>%
+  filter(str_detect(indiv_1,"G006146")|str_detect(indiv_2,"G006146"))|>
+  mutate(pct = num_mismatch/num_loc)
+```
+That's why it has so many mismatches. G006146-swab is a duplicate sample of G006145.
+
+Go back and look at the 2 other non het-to-hom mismatch
+
+```{r,same-gt-mismatch-investigate}
+mismatch_genos |> group_by(indiv_id, Locus, gt_type) |>
+  filter(n()>1, !str_detect(indiv_id, "G006146")) 
+```
+
+In each case 1 allele is shared and the second allele is different. Go back to raw data and see if we can find the different alleles within each sample
+
+```{r, find-missing-haplo-mismatchers-different-gt-type}
+mhap2process |>
+  filter((indiv_id=="G006119"&locus=="JH816924.1")|(indiv_id=="G006131"&locus=="JH823024.1")) |>
+  dplyr::select(indiv_id, locus, haplo, depth, sample_id) |>
+  arrange(sample_id, locus, desc(depth)) |>
+  group_by(sample_id, locus) |> slice(1:5) #retain top 5 haplos per locus per indiv
+```
+For G006119 at locus JH816924.1 the genotypes are identical, but the second allele was filtered out because of an N allele in the haplotype. This could be a deletion, but because of it's position as the first SNP it's suspicious. 
+
+For G006131, the swab sample had higher read depth compared to adductor, and the missing allele from the swab heterozygote is 'ATTATTC' which is the 3rd ranked allele in the adductor sample. That missing haplotype has 1 fewer read than the 2nd allele, and because the 3rd ranked allele is less than 0.30 of the top allele it was filtered out in data processing.
+
+I'm satisfied with the investigation of these samples. Now let's come back to the het-to-hom mismatches and categorize them a bit.
+
+```{r, explor-hom-to-het-mismatch}
+mismatch_genos |> group_by(indiv_id, Locus,gt_type) |> filter(n()==1) |>
+  filter(!indiv_id=="G006146") |> # remove the contaminated sample
+  arrange(indiv_id, Locus)
+```
+
+
+Determine if the missing allele in homozygotes is present in the raw sequencing data
+
+```{r, find-missing-allele}
+df_missing_alleles <- mismatch_genos |> group_by(indiv_id, Locus,gt_type) |> filter(n()==1) |>
+  filter(!indiv_id=="G006146") |> # remove the contaminated sample
+  arrange(indiv_id, Locus) |>
+  separate(gt, into=c("hap_1", "hap_2"), sep = "_")|>
+  dplyr::select(Indiv, Locus, hap_1, hap_2) |>
+  pivot_longer(cols=c(hap_1,hap_2),names_to="rank", values_to = "haplo") |>
+  group_by(indiv_id, Locus, haplo) |>
+  filter(n()==1) |> #retain the haplo that's missing from the homozygote.
+  mutate(indiv2check = ifelse(str_detect(Indiv,"adductor"), 
+                              paste0(indiv_id, "-Swab"),
+                              paste0(indiv_id, "-Adductor"))) |>
+  ungroup() |>
+  rename(locus=Locus)|>
+  dplyr::select(indiv2check,locus, haplo) #some clean up to make this easier to follow
+ 
+df_missing_alleles                                                                 
+```
+
+look in raw data now that I have the missing allele in a dataframe to join
+```{r, find-missing-haplo-hom2het}
+mhap2process|> mutate(indiv2check = paste0(indiv_id, "-",samp_type),
+                      indiv2check = str_replace_all(indiv2check,"adductor","Adductor"))|>
+  dplyr::select(indiv2check, locus, haplo, rank, allele.balance, depth) |>
+  arrange(indiv2check,locus, desc(depth)) |>
+  right_join(df_missing_alleles, join_by(indiv2check, locus, haplo)) |> 
+  arrange(desc(is.na(rank))) 
+```
+Most of the missing alleles are present in the raw sequencing data. only 6 cases where the missing allele is not present in the raw sequencing data. They come from 5 different samples.
+ 
+Summarise the missing haplotype information
+```{r, summarise-missing-hom2het-haplotype-info-plot}
+mhap2process |> mutate(indiv2check = paste0(indiv_id, "-",samp_type),
+                      indiv2check = str_replace_all(indiv2check,"adductor","Adductor"))|>
+  dplyr::select(indiv2check, locus, haplo, rank, allele.balance, depth) |>
+  arrange(indiv2check,locus, desc(depth)) |>
+  right_join(df_missing_alleles, join_by(indiv2check, locus, haplo)) |> 
+  arrange(desc(is.na(rank))) |>
+  ggplot(aes(x=rank, y=allele.balance)) + geom_point() + geom_hline(yintercept = 0.30)
+```
+
+```{r, count-summary-missing-hom2het-haplotype}
+mhap2process|> mutate(indiv2check = paste0(indiv_id, "-",samp_type),
+                      indiv2check = str_replace_all(indiv2check,"adductor","Adductor"))|>
+  dplyr::select(indiv2check, locus, haplo, rank, allele.balance, depth) |>
+  arrange(indiv2check,locus, desc(depth)) |>
+  right_join(df_missing_alleles, join_by(indiv2check, locus, haplo)) |> 
+  count(rank) |>
+  mutate(pct_rank = round(n/sum(n),2))|>
+group_by(rank>=10) |> mutate(tot_pct = sum(pct_rank)) |> ungroup()|>
+  mutate(tot_mismatch=sum(n))
+```
+
+So there should be 303 mismatching cases in this data total, after removing G006146. Let's double check that with the original data
+```{r, total-number-mismatching-loci}
+mismatch_genos |> distinct(indiv_id, Locus) |> filter(!indiv_id=="G006146") |> nrow()
+```
+
+Coolio. onwards.
+
+summarization of mismatching cases into figures.
+ 
+```{r,make-ggplot}
+mismatchers |>
+  mutate(indiv= str_extract(indiv_1, "G[0-9]{6}")) |>
+  filter(!indiv=="G006146")|> #remove lab/sampling error
+  ggplot(aes(x=indiv, y=100*pct_discorant)) + geom_point(shape=15, size=2) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 280,vjust = 0.5, hjust = 0.1))+
+  geom_text(aes(
+    label=num_loc, y=14.25),size=4,
+     angle=65) +
+  xlab("Individual")+
+  scale_y_continuous(limits=c(0,15), breaks = seq(0.0,15,1), name = "Non-concordance rate")
+
+#ggsave("./thermofisher-mh-nonconcordance-rate-fig5c.png")
+```
+ 
+make figure 5c, then run SNP RMD to make the entire figure.
+```{r, fig5c}
+fig5c <- mismatchers |>
+  mutate(indiv= str_extract(indiv_1, "G[0-9]{6}")) |>
+  filter(!indiv=="G006146")|> #remove lab/smapling erorr
+  ggplot(aes(x=indiv, y=100*pct_discorant)) + geom_point(shape=15, size=2) +
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 280,vjust = 0.5, hjust = 0.1))+
+  geom_text(aes(
+    label=num_loc, y=14.25),size=4,
+     angle=65) +
+  xlab("Individual")+
+  scale_y_continuous(limits=c(0,15), breaks = seq(0.0,15,1), name = "Non-concordance rate")
+```
+ 
+ 
