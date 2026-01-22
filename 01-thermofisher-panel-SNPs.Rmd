@@ -1,0 +1,238 @@
+---
+title: "01-thermofisher-panel-SNPs"
+output: html_document
+date: "`r Sys.Date()`"
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## SNP data from CAT via thermofisher calling pipeline
+CAT data ID is 'G0124-31-USDA'
+```{r, libraries,warning=FALSE,message=FALSE}
+library(tidyverse)
+library(readxl)
+library(ggpubr)
+```
+
+load QA/QC data from CATC
+```{r, load-genotype-data}
+gt_qc <- read_xlsx("./G0124-31-USDA_QC-TABLE.xlsx") %>%
+  rename(indiv_id = 1, 
+         call_raw = 2,
+         call_70qc = 3)
+
+#summarise call rates by type
+gt_qc %>% 
+  mutate(indiv = str_extract(indiv_id, "G[0-9]{6}"),
+         sample_type = str_extract(indiv_id, "Swab|adductor")) %>%
+  filter(!indiv=="G006146") %>%
+  ggplot(., aes(x=indiv, y=call_raw, shape=sample_type, colour=sample_type, fill=sample_type)) + geom_point() +
+  theme_bw() +
+      theme(axis.text.x = element_text(angle = 300,vjust = 0.5, hjust = 0.1)) +
+  ggtitle("GBS data")
+```
+
+which samples failed genotyping?
+```{r,ID-failed-samples}
+gt_qc %>%
+  mutate(indiv_g = str_sub(indiv_id,1,7),
+         samp_type = str_sub(indiv_id,8,8)) %>%
+  arrange(indiv_g) %>%
+  group_by(indiv_g)%>%
+        mutate(row_id = cur_group_id()) %>%
+  filter(call_70qc=="FAILED",
+         samp_type=="S")
+
+failed_qc <- gt_qc%>%
+  filter(str_detect(call_70qc, "FAIL")) %>% 
+  mutate(indiv = str_extract(indiv_id, "G[0-9]{6}")) %>% pull(indiv)
+
+gt_qc %>% 
+  mutate(run_status = case_when(
+    str_detect(call_70qc,"[0-9]") ~ "pass",
+    call_70qc =="FAILED" ~ "fail")) %>% count(run_status)
+```
+twelve samples out of 96 failed. 
+
+boxplot of call rates per sample type
+```{r,boxplot-callrates-sampletype}
+bplot_raw <- gt_qc %>%
+  mutate(sample_type = str_extract(indiv_id, "Swab|adductor"),
+         sample_type = ifelse(sample_type=="adductor", "Adductor", sample_type)) %>%
+  filter(!str_detect(indiv_id, "G006146")) %>%
+  ggplot(., aes(x=sample_type, y=call_raw)) + geom_boxplot() +
+  theme_bw() +
+  scale_y_continuous(limits=c(20,100), breaks=seq(20,100,10)) +
+  ylab("Genotype calling percentage") +
+  xlab("Sample type") 
+bplot_raw 
+
+bplot_70 <- gt_qc %>%
+  mutate(sample_type = str_extract(indiv_id, "Swab|adductor"),
+         sample_type = ifelse(sample_type=="adductor", "Adductor", sample_type)) %>%
+  filter(!str_detect(indiv_id, "G006146"),
+         !call_70qc =="FAILED") %>%
+  mutate(call_70qc = as.numeric(call_70qc))%>%
+  
+  ggplot(., aes(x=sample_type, y=call_70qc)) + geom_boxplot() +
+  theme_bw() +
+    scale_y_continuous(limits=c(70,100), breaks=seq(70,100,10)) +
+  ylab("Genotype calling percentage") + #
+  xlab("Sample type") 
+bplot_70
+
+ggarrange(bplot_raw, bplot_70, labels = c("A", "B"))
+```
+
+The QC70 dataset is when CAT filtered out loci that scored in less than
+70% of all samples. So it's removing poor performing loci out of the 440 loci
+scored by CAT.  
+
+paired t-test on difference in call rate? either raw call or qc70?
+```{r,t-test-callrate}
+raw_ttest <- gt_qc %>%
+    mutate(sample_type = str_extract(indiv_id, "Swab|adductor"),
+           indiv = str_extract(indiv_id, "G[0-9]{6}")) %>%
+  dplyr::select(indiv, sample_type, call_raw) %>%
+  pivot_wider(., names_from = "sample_type", values_from="call_raw") 
+  
+t.test(x = raw_ttest$adductor,
+         y = raw_ttest$Swab,
+         paired = TRUE)
+
+c70_ttest <- gt_qc %>%
+    mutate(sample_type = str_extract(indiv_id, "Swab|adductor"),
+           indiv = str_extract(indiv_id, "G[0-9]{6}")) %>%
+    dplyr::select(indiv, sample_type, call_70qc) %>%
+  group_by(indiv) %>% filter(!any(call_70qc=="FAILED")) %>% ungroup() %>%
+  mutate(call_70qc = as.numeric(call_70qc)) %>%
+  pivot_wider(., names_from = "sample_type", values_from="call_70qc") 
+
+t.test(x = c70_ttest$adductor,
+         y = c70_ttest$Swab,
+         paired = TRUE)
+```
+
+load plink data
+```{r,load-plink-genotype-data}
+plink_gt <- read_tsv("./data-plink/G0124-31-USDA_440-SNPs.map", col_names = FALSE) %>%
+  rename(chr=1,
+         loc_id = 2,
+         gen_dist = 3, 
+         pos =4)
+
+loc_list <- plink_gt %>% distinct(loc_id)
+
+loc_cols <- bind_rows(loc_list, loc_list) %>% arrange(loc_id) %>% group_by(loc_id) %>%
+  mutate(loc_allele = paste0(loc_id, "_", row_number())%>%as.character(.)) %>% pull(loc_allele)
+
+snp_gts <- read_tsv("./data-plink/G0124-31-USDA_440-SNPs.ped", col_names=FALSE,col_types = cols(.default = "c")) %>%
+  rename(indiv_id = 1) %>%
+  dplyr::select(-c(X2:X6))
+
+colnames(snp_gts) <- c("indiv_id", loc_cols)
+
+long_snps <- snp_gts %>% 
+  pivot_longer(-1, names_to="loc_allele", values_to="allele") %>%
+  mutate(allele = ifelse(allele=="0", NA, allele))
+
+long_snps %>% mutate(locus =str_sub(loc_allele, 1, -3)) %>% distinct(locus) %>% nrow(.) #440 loci total
+```
+Total of 440 loci in the PLINK file.
+
+#how many genos are the same? what is the percentage of same genotype?
+```{r, same-geno-analysis}
+snp_same <- long_snps %>%
+  filter(!is.na(allele)) %>%
+  mutate(locus = str_sub(loc_allele,1,-3)) %>% 
+  arrange(locus,allele) %>% #sort so ACGT order
+  group_by(indiv_id,locus) %>%
+  mutate(gt = paste0(allele, collapse="/")) %>%
+  slice(1) %>%
+  mutate(indiv = str_extract(indiv_id, "G[0-9]{6}"),
+         sample_type = str_extract(indiv_id, "Swab|adductor")) %>%
+  group_by(indiv,locus) %>% 
+  filter(n()==2) %>% #keep only samples with swab AND adductor genotypes
+  arrange(indiv,locus) %>%
+  mutate(gt_same = gt[1]==gt[2]) %>% #identify same GT or not
+  ungroup() %>% distinct(indiv,locus,.keep_all=T) %>% count(indiv,gt_same) %>%
+  group_by(indiv) %>%
+  mutate(pct_same = n/sum(n),
+         tot_loci = sum(n)) %>% filter(gt_same==TRUE) %>% ungroup()
+  
+pct_error <- snp_same %>%
+  mutate(fail_qc = !indiv %in% failed_qc,
+         pct_nc = (1-pct_same)*100) %>%
+  filter(!indiv=="G006146") %>% # remove  sample that is lab/sampling error
+ggplot(., aes(x=indiv, y=pct_nc, shape = fail_qc)) + geom_point() + 
+  theme_bw() +
+  theme(axis.text.x = element_text(angle = 280,vjust = 0.5, hjust = 0.1))+
+  scale_y_continuous(limits = c(0, 5.25), name = "Non-concordance rate") + 
+  scale_x_discrete(name="") +
+  guides(shape=guide_legend(title="Passing quality control", position = "top"))+
+  geom_text(aes(
+    label=tot_loci, y=4.75),
+    size=10,
+     angle=65, size.unit = "pt")  
+```
+
+how many loci per indiv?
+```{r}
+snp_same |> arrange(tot_loci)
+```
+
+summarise the mismatching loci
+```{r, summarise-mismatching-loci}
+long_snps %>%
+  filter(!is.na(allele)) %>%
+  mutate(locus = str_sub(loc_allele,1,-3)) %>% 
+  arrange(locus,allele) %>% #sort so ACGT order
+  group_by(indiv_id,locus) %>%
+  mutate(gt = paste0(allele, collapse="/")) %>%
+  slice(1) %>%
+  mutate(indiv = str_extract(indiv_id, "G[0-9]{6}"),
+         sample_type = str_extract(indiv_id, "Swab|adductor")) %>%
+  group_by(indiv,locus) %>% 
+  filter(n()==2) |> #keep only samples with swab AND adductor genotypes
+  filter(!gt[1]==gt[2]) |> #keep only mismatching genotypes 
+  filter(!indiv=="G006146") |> #remove the lab prep/sampling error
+  mutate(gt_type = case_when(
+    str_sub(gt,1,1)==str_sub(gt,-1,-1) ~"hom",
+    !str_sub(gt,1,1)==str_sub(gt,-1,-1) ~"het"))|>
+  ungroup() |>
+  count(indiv,locus,gt_type) |> filter(n>1) #no cases of hom-to-hom or het-to-het mismatches
+
+long_snps %>%
+  filter(!is.na(allele)) %>%
+  mutate(locus = str_sub(loc_allele,1,-3)) %>% 
+  arrange(locus,allele) %>% #sort so ACGT order
+  group_by(indiv_id,locus) %>%
+  mutate(gt = paste0(allele, collapse="/")) %>%
+  slice(1) %>%
+  mutate(indiv = str_extract(indiv_id, "G[0-9]{6}"),
+         sample_type = str_extract(indiv_id, "Swab|adductor")) %>%
+  group_by(indiv,locus) %>% 
+  filter(n()==2) |> #keep only samples with swab AND adductor genotypes
+  filter(!gt[1]==gt[2]) |> #keep only mismatching genotypes 
+  filter(!indiv=="G006146") |> #remove the lab prep/sampling error
+  mutate(gt_type = case_when(
+    str_sub(gt,1,1)==str_sub(gt,-1,-1) ~"hom",
+    !str_sub(gt,1,1)==str_sub(gt,-1,-1) ~"het"))|>
+  ungroup() |> count(sample_type,gt_type) #number of mismatches per tissue type
+```
+
+
+
+Now make figure 5 for the paper
+
+Need to run the chunk below when having fig5c from 02-thermofisher-panel-microhaplotypes.rmd open in the same session. otherwise this will bonk and be frustrating.
+```{r, make-fig5c}
+inderrs<-ggarrange(pct_error,fig5c, labels = c("B", "C"), nrow=2,  label.y = c(1, 1.05))
+
+ggarrange(bplot_70, inderrs, labels = c("A", ""), nrow = 1, widths = c(0.45, 1.2))
+
+#ggsave("./Fig5-gigas.pdf", width = 10, height = 6)
+#ggsave("./Fig5-gigas.png", width = 10, height = 6)
+```
