@@ -52,7 +52,7 @@ ped922.AA.ord.clean<-ped922.AA.ord.clean[,-1]
 
 row.names(ped922.AA.ord.clean)<-ped922.AA.ord.clean$V1
 ped922.AA.ord.clean<-ped922.AA.ord.clean[,-1]
-
+```
 Testing 1st rd samples. 
 ```{r Concordance test script}
 INSERT ONCE EVERNOTE IS ACCESSIBLE...
@@ -77,6 +77,7 @@ ped124.AA<-cbind(ped124.filt.clean [1], mapply(paste0, ped124.filt.clean[, seq(7
 ped124.AA[ped124.AA == "00"]<-NA
 row.names(ped124.AA)<-ped124.AA$V1
 ped124.AA<-ped124.AA[,-1]
+```
 
 Testing 2nd rd samples. 
 ```{r Concordance test script}
