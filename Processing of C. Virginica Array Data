@@ -81,8 +81,17 @@ ped124.AA<-ped124.AA[,-1]
 
 Testing 2nd rd samples. 
 ```{r Concordance test script}
-INSERT ONCE EVERNOTE IS ACCESSIBLE...
+vect_1 <- c(seq(from=1,to=59,by=2))
+vect_2 <- double(length(vect_1))
+names<-row.names(ped.AA)
 
+for(num in vect_1) {
+    vect_2[num] <- as.numeric(table(ped.AA[num,] == ped.AA[num+1,]))[1]/(as.numeric(table(ped.AA[num,] == ped.AA[num+1,]))[1] + as.numeric(table(ped.AA[num,] == ped.AA[num+1,]))[2])*100
+}
+
+vect_2
+output<-cbind(names[seq(from=1,to=59,by=2)],vect_2[seq(from=1,to=59,by=2)])
+output
 
 ```
 
