@@ -98,3 +98,6 @@ output
 
 
 ```
+## Figures.
+p<-ggplot(data=subset(df1,type == "cott" | type == "masc" | type == "brush" | type == "mantle"),aes(x=type,y=Error_AA))+geom_boxplot()+geom_jitter(alpha=.5,size=2.5,aes(shape=QualityPass))+theme_bw()
+p+labs(x="\nSample Type",y="Non-concordance rate")+theme(axis.text.y= element_text( size=12),axis.title=element_text(size=14,face="bold"),axis.text.x=element_text(size=12))+scale_y_continuous(limits=c(0,6))
