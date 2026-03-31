@@ -46,7 +46,7 @@ ped922.AA.ord.clean<-ped922.AA.ord.clean %>% mutate(nreps=if_else(row_number() =
 ped922.AA.ord.clean$V1[6] <-"HPL Biospsy 2022, 8b Add (DNA)"
 ped922.AA.ord.clean<-ped922.AA.ord.clean %>% arrange(desc(V1))
 ped922.AA.ord.clean<-ped922.AA.ord.clean[-c(7,22),]
-ped922.AA.ord.clean<-ped922.AA.ord.clean[,-1]
+
 
 #sample names are row names
 
@@ -55,11 +55,19 @@ ped922.AA.ord.clean<-ped922.AA.ord.clean[,-1]
 ```
 Testing 1st rd samples. 
 ```{r Concordance test script}
-INSERT ONCE EVERNOTE IS ACCESSIBLE...
+vect_1 <- c(seq(from=1,to=45,by=2))
+vect_2 <- double(length(vect_1))
+names<-row.names(ped922.AA.ord.clean)
+names[1:10]
 
+for(num in vect_1) {
+    vect_2[num] <- as.numeric(table(ped922.AA.ord.clean[num,] == ped922.AA.ord.clean[num+1,]))[1]/(as.numeric(table(ped922.AA.ord.clean[num,] == ped922.AA.ord.clean[num+1,]))[1] + as.numeric(table(ped922.AA.ord.clean[num,] == ped922.AA.ord.clean[num+1,]))[2])*100
+}
+
+output<-cbind(names[seq(from=1,to=45,by=2)],vect_2[seq(from=1,to=45,by=2)])
+output
 
 ```
-
 
 
 ## load and test 2ND round of genotyping samples (minimal cleanup)
@@ -75,7 +83,7 @@ ped124.filt.clean[["V1"]]<-names
 
 ped124.AA<-cbind(ped124.filt.clean [1], mapply(paste0, ped124.filt.clean[, seq(7,ncol(ped124.filt.clean),2)],ped124.filt.clean[,seq(8,ncol(ped124.filt.clean),2)]))
 ped124.AA[ped124.AA == "00"]<-NA
-row.names(ped124.AA)<-ped124.AA$V1
+row.names(ped124.AA)<-ped124.AA$V1$x
 ped124.AA<-ped124.AA[,-1]
 ```
 
@@ -83,10 +91,10 @@ Testing 2nd rd samples.
 ```{r Concordance test script}
 vect_1 <- c(seq(from=1,to=59,by=2))
 vect_2 <- double(length(vect_1))
-names<-row.names(ped.AA)
+names<-row.names(ped124.AA)
 
 for(num in vect_1) {
-    vect_2[num] <- as.numeric(table(ped.AA[num,] == ped.AA[num+1,]))[1]/(as.numeric(table(ped.AA[num,] == ped.AA[num+1,]))[1] + as.numeric(table(ped.AA[num,] == ped.AA[num+1,]))[2])*100
+    vect_2[num] <- as.numeric(table(ped124.AA[num,] == ped124.AA[num+1,]))[1]/(as.numeric(table(ped124.AA[num,] == ped124.AA[num+1,]))[1] + as.numeric(table(ped124.AA[num,] == ped124.AA[num+1,]))[2])*100
 }
 
 vect_2
